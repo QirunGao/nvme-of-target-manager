@@ -1,0 +1,17 @@
+[Unit]
+Description=Minimal NVMe-oF target manager (%i)
+Wants=network-online.target
+After=network-online.target
+After=zfs-volume-wait.service
+Requires=systemd-modules-load.service
+After=systemd-modules-load.service
+RequiresMountsFor=/sys/kernel/config
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nvme-of-target-manager start -c /etc/nvme-of/%i
+ExecStop=/usr/sbin/nvme-of-target-manager stop -c /etc/nvme-of/%i
+
+[Install]
+WantedBy=multi-user.target

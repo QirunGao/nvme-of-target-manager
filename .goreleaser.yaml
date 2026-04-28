@@ -1,0 +1,100 @@
+version: 2
+
+project_name: nvme-of-target-manager
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: manager
+    main: .
+    binary: nvme-of-target-manager
+
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    tags:
+      - osusergo
+      - netgo
+    ldflags:
+      - -s -w -buildid=
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+nfpms:
+  - id: linux
+    package_name: nvme-of-target-manager
+    formats:
+      - deb
+      - rpm
+
+    file_name_template: "{{ .ConventionalFileName }}"
+    bindir: /usr/sbin
+
+    maintainer: "GQR <noreply@gaoqirun.com>"
+    description: "Minimal NVMe-oF configfs manager"
+    section: admin
+    priority: optional
+    vendor: "nvme-of-target-manager"
+
+    rpm:
+      summary: "Minimal NVMe-oF configfs manager"
+      group: "Applications/System"
+      packager: "GQR <noreply@gaoqirun.com>"
+
+    ids:
+      - manager
+
+    dependencies:
+      - systemd
+      - kmod
+
+    contents:
+      - src: ./README.md
+        dst: /usr/share/doc/nvme-of-target-manager/README.md
+
+      - src: ./config.example.toml
+        dst: /etc/nvme-of/config.toml
+        type: config|noreplace
+        file_info:
+          mode: 0600
+
+      - src: ./nvme-of-target-manager@.service
+        dst: /lib/systemd/system/nvme-of-target-manager@.service
+        packager: deb
+        file_info:
+          mode: 0644
+
+      - src: ./nvme-of-target-manager@.service
+        dst: /usr/lib/systemd/system/nvme-of-target-manager@.service
+        packager: rpm
+        file_info:
+          mode: 0644
+
+      - src: ./nvme-of-target.conf
+        dst: /etc/modules-load.d/nvme-of-target.conf
+        file_info:
+          mode: 0644
+
+    scripts:
+      postinstall: ./scripts/package/postinst
+      postremove: ./scripts/package/postrm
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

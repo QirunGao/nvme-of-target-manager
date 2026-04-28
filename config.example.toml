@@ -1,0 +1,17 @@
+[subsystem]
+nqn = "nqn.2026-04.local:disk1"
+
+[namespace]
+id = 1
+backing_dev = "/dev/nvme1n1"
+
+[port]
+id = 1
+transport = "tcp"
+address_family = "ipv4"
+address = "192.168.1.10"
+service_id = 4420
+
+[hosts]
+allow_any_host = true
+allowed = []
