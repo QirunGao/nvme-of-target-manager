@@ -19,8 +19,9 @@ import (
 
 const (
 	defaultConfigPath = "/etc/nvme-of/config.toml"
-	version           = "0.1.0"
+	version           = "0.1.1"
 	lockWaitTimeout   = 30 * time.Second
+	attrWriteTimeout  = 2 * time.Second
 )
 
 var (
@@ -732,10 +733,17 @@ func readAttr(path string) string {
 }
 
 func writeAttr(path, value string) error {
-	if err := os.WriteFile(path, []byte(value), 0600); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+	deadline := time.Now().Add(attrWriteTimeout)
+	for {
+		err := os.WriteFile(path, []byte(value), 0600)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) || time.Now().After(deadline) {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	return nil
 }
 
 func removeDirIfExists(path string) error {
