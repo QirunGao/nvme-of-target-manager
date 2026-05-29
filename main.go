@@ -19,9 +19,9 @@ import (
 
 const (
 	defaultConfigPath = "/etc/nvme-of/config.toml"
-	version           = "0.1.1"
+	version           = "0.1.2"
 	lockWaitTimeout   = 30 * time.Second
-	attrWriteTimeout  = 2 * time.Second
+	attrWriteTimeout  = 10 * time.Second
 )
 
 var (
@@ -555,7 +555,6 @@ func createTarget(c Config, p Paths) error {
 	if err := os.MkdirAll(p.Namespace, 0700); err != nil {
 		return fmt.Errorf("mkdir namespace: %w", err)
 	}
-	_ = writeAttr(filepath.Join(p.Namespace, "enable"), "0")
 	if err := writeAttr(filepath.Join(p.Namespace, "device_path"), c.BackingDev); err != nil {
 		return err
 	}
