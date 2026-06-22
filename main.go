@@ -19,13 +19,14 @@ import (
 
 const (
 	defaultConfigPath = "/etc/nvme-of/config.toml"
-	version           = "0.1.2"
+	version           = "0.1.3"
 	lockWaitTimeout   = 30 * time.Second
 	attrWriteTimeout  = 10 * time.Second
 )
 
 var (
 	nvmetPath        = "/sys/kernel/config/nvmet"
+	rdmaCMPath       = "/sys/kernel/config/rdma_cm"
 	configfsPath     = "/sys/kernel/config"
 	errStatusNonZero = errors.New("status is not active")
 	lockFilePath     = "/run/nvme-of-target-manager.lock"
@@ -59,19 +60,31 @@ type RawConfig struct {
 		AllowAnyHost bool     `toml:"allow_any_host"`
 		Allowed      []string `toml:"allowed"`
 	} `toml:"hosts"`
+	QoS struct {
+		Enabled     bool   `toml:"enabled"`
+		RDMADevice  string `toml:"rdma_device"`
+		RDMAPort    int    `toml:"rdma_port"`
+		RoCETOS     int    `toml:"roce_tos"`
+		PCPPriority int    `toml:"pcp_priority"`
+	} `toml:"qos"`
 }
 
 type Config struct {
-	NQN           string
-	NSID          int
-	BackingDev    string
-	PortID        int
-	Transport     string
-	AddressFamily string
-	Address       string
-	ServiceID     int
-	AllowAnyHost  bool
-	AllowedHosts  []string
+	NQN            string
+	NSID           int
+	BackingDev     string
+	PortID         int
+	Transport      string
+	AddressFamily  string
+	Address        string
+	ServiceID      int
+	AllowAnyHost   bool
+	AllowedHosts   []string
+	QoSEnabled     bool
+	QoSRDMADevice  string
+	QoSRDMAPort    int
+	QoSRoCETOS     int
+	QoSPCPPriority int
 }
 
 type Paths struct {
@@ -85,6 +98,9 @@ type Paths struct {
 	PortLink       string
 	Hosts          string
 	AllowedHosts   string
+	RDMACMDevice   string
+	RDMACMPort     string
+	RDMADefaultTOS string
 }
 
 type Runtime struct {
@@ -209,16 +225,21 @@ func loadConfig(path string) (Config, error) {
 
 func validateConfig(raw RawConfig) (Config, error) {
 	c := Config{
-		NQN:           raw.Subsystem.NQN,
-		NSID:          raw.Namespace.ID,
-		BackingDev:    raw.Namespace.BackingDev,
-		PortID:        raw.Port.ID,
-		Transport:     raw.Port.Transport,
-		AddressFamily: raw.Port.AddressFamily,
-		Address:       raw.Port.Address,
-		ServiceID:     raw.Port.ServiceID,
-		AllowAnyHost:  raw.Hosts.AllowAnyHost,
-		AllowedHosts:  append([]string(nil), raw.Hosts.Allowed...),
+		NQN:            raw.Subsystem.NQN,
+		NSID:           raw.Namespace.ID,
+		BackingDev:     raw.Namespace.BackingDev,
+		PortID:         raw.Port.ID,
+		Transport:      raw.Port.Transport,
+		AddressFamily:  raw.Port.AddressFamily,
+		Address:        raw.Port.Address,
+		ServiceID:      raw.Port.ServiceID,
+		AllowAnyHost:   raw.Hosts.AllowAnyHost,
+		AllowedHosts:   append([]string(nil), raw.Hosts.Allowed...),
+		QoSEnabled:     raw.QoS.Enabled,
+		QoSRDMADevice:  raw.QoS.RDMADevice,
+		QoSRDMAPort:    raw.QoS.RDMAPort,
+		QoSRoCETOS:     raw.QoS.RoCETOS,
+		QoSPCPPriority: raw.QoS.PCPPriority,
 	}
 
 	for field, value := range map[string]string{
@@ -232,7 +253,7 @@ func validateConfig(raw RawConfig) (Config, error) {
 			return Config{}, err
 		}
 	}
-	if !validConfigfsName(c.NQN) || !(strings.HasPrefix(c.NQN, "nqn.") || strings.HasPrefix(c.NQN, "eui.")) {
+	if !validConfigfsName(c.NQN) || !hasNQNPrefix(c.NQN) {
 		return Config{}, fmt.Errorf("invalid subsystem nqn: %q", c.NQN)
 	}
 	if c.NSID <= 0 {
@@ -278,7 +299,7 @@ func validateConfig(raw RawConfig) (Config, error) {
 		if err := rejectOuterWhitespace("hosts.allowed", host); err != nil {
 			return Config{}, err
 		}
-		if !validConfigfsName(host) || !(strings.HasPrefix(host, "nqn.") || strings.HasPrefix(host, "eui.")) {
+		if !validConfigfsName(host) || !hasNQNPrefix(host) {
 			return Config{}, fmt.Errorf("invalid host nqn: %q", host)
 		}
 		if _, ok := seenHosts[host]; ok {
@@ -293,6 +314,29 @@ func validateConfig(raw RawConfig) (Config, error) {
 	if !c.AllowAnyHost && len(c.AllowedHosts) == 0 {
 		return Config{}, errors.New("hosts.allow_any_host=false requires at least one allowed host")
 	}
+	if c.QoSEnabled {
+		if err := rejectOuterWhitespace("qos.rdma_device", c.QoSRDMADevice); err != nil {
+			return Config{}, err
+		}
+		if c.Transport != "rdma" {
+			return Config{}, errors.New("qos.enabled=true requires port.transport=rdma")
+		}
+		if !validConfigfsName(c.QoSRDMADevice) {
+			return Config{}, fmt.Errorf("invalid qos.rdma_device: %q", c.QoSRDMADevice)
+		}
+		if c.QoSRDMAPort <= 0 {
+			return Config{}, errors.New("qos.rdma_port must be greater than 0")
+		}
+		if c.QoSRoCETOS < 0 || c.QoSRoCETOS > 255 {
+			return Config{}, errors.New("qos.roce_tos must be in 0..255")
+		}
+		if c.QoSPCPPriority < 0 || c.QoSPCPPriority > 7 {
+			return Config{}, errors.New("qos.pcp_priority must be in 0..7")
+		}
+		if c.QoSRoCETOS>>5 != c.QoSPCPPriority {
+			return Config{}, errors.New("qos.roce_tos high 3 bits must match qos.pcp_priority")
+		}
+	}
 
 	return c, nil
 }
@@ -305,6 +349,8 @@ func derivePaths(c Config) Paths {
 	subsys := filepath.Join(subsystems, c.NQN)
 	namespaces := filepath.Join(subsys, "namespaces")
 	port := filepath.Join(ports, strconv.Itoa(c.PortID))
+	rdmaDevice := filepath.Join(rdmaCMPath, c.QoSRDMADevice)
+	rdmaPort := filepath.Join(rdmaDevice, "ports", strconv.Itoa(c.QoSRDMAPort))
 
 	return Paths{
 		Subsystems:     subsystems,
@@ -317,6 +363,9 @@ func derivePaths(c Config) Paths {
 		PortLink:       filepath.Join(port, "subsystems", c.NQN),
 		Hosts:          hosts,
 		AllowedHosts:   filepath.Join(subsys, "allowed_hosts"),
+		RDMACMDevice:   rdmaDevice,
+		RDMACMPort:     rdmaPort,
+		RDMADefaultTOS: filepath.Join(rdmaPort, "default_roce_tos"),
 	}
 }
 
@@ -334,6 +383,11 @@ func prepare(c Config) error {
 	if err := runCommandQuiet("modprobe", "nvmet-"+c.Transport); err != nil {
 		return err
 	}
+	if c.QoSEnabled {
+		if err := runCommandQuiet("modprobe", "rdma_cm"); err != nil {
+			return err
+		}
+	}
 
 	if err := os.MkdirAll(configfsPath, 0755); err != nil {
 		return fmt.Errorf("mkdir configfs mountpoint: %w", err)
@@ -346,6 +400,9 @@ func prepare(c Config) error {
 	if !isDir(nvmetPath) {
 		return fmt.Errorf("configfs nvmet path is not available: %s", nvmetPath)
 	}
+	if c.QoSEnabled && !isDir(rdmaCMPath) {
+		return fmt.Errorf("configfs rdma_cm path is not available: %s", rdmaCMPath)
+	}
 
 	return nil
 }
@@ -353,91 +410,105 @@ func prepare(c Config) error {
 func observe(c Config, p Paths) (Runtime, State) {
 	var r Runtime
 
-	if exists(p.Subsystems) && !isDir(p.Subsystems) {
+	if existsNotDir(p.Subsystems) {
 		r.BlockedReason = "subsystems path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.Subsystem) && !isDir(p.Subsystem) {
+	if existsNotDir(p.Subsystem) {
 		r.BlockedReason = "subsystem path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.Namespaces) && !isDir(p.Namespaces) {
+	if existsNotDir(p.Namespaces) {
 		r.BlockedReason = "namespaces path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.Namespace) && !isDir(p.Namespace) {
+	if existsNotDir(p.Namespace) {
 		r.BlockedReason = "namespace path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.Ports) && !isDir(p.Ports) {
+	if existsNotDir(p.Ports) {
 		r.BlockedReason = "ports path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.Port) && !isDir(p.Port) {
+	if existsNotDir(p.Port) {
 		r.BlockedReason = "port path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.PortSubsystems) && !isDir(p.PortSubsystems) {
+	if existsNotDir(p.PortSubsystems) {
 		r.BlockedReason = "port subsystems path exists but is not directory"
 		return r, StateBlocked
 	}
-	if exists(p.PortLink) && !isSymlink(p.PortLink) {
+	if existsNotSymlink(p.PortLink) {
 		r.BlockedReason = "port subsystem link path exists but is not symlink"
 		return r, StateBlocked
 	}
-	if exists(p.AllowedHosts) && !isDir(p.AllowedHosts) {
+	if existsNotDir(p.AllowedHosts) {
 		r.BlockedReason = "allowed_hosts path exists but is not directory"
 		return r, StateBlocked
 	}
 	if isDir(p.AllowedHosts) {
 		for _, host := range c.AllowedHosts {
 			linkPath := filepath.Join(p.AllowedHosts, host)
-			if exists(linkPath) && !isSymlink(linkPath) {
+			if existsNotSymlink(linkPath) {
 				r.BlockedReason = "allowed host link path exists but is not symlink"
 				return r, StateBlocked
 			}
 		}
 	}
 	if len(c.AllowedHosts) != 0 {
-		if exists(p.Hosts) && !isDir(p.Hosts) {
+		if existsNotDir(p.Hosts) {
 			r.BlockedReason = "hosts path exists but is not directory"
 			return r, StateBlocked
 		}
 		for _, host := range c.AllowedHosts {
 			hostPath := filepath.Join(p.Hosts, host)
-			if exists(hostPath) && !isDir(hostPath) {
+			if existsNotDir(hostPath) {
 				r.BlockedReason = "host path exists but is not directory"
 				return r, StateBlocked
 			}
 		}
 	}
-	if exists(filepath.Join(p.Subsystem, "attr_allow_any_host")) && !isRegularFile(filepath.Join(p.Subsystem, "attr_allow_any_host")) {
+	if existsNotRegularFile(filepath.Join(p.Subsystem, "attr_allow_any_host")) {
 		r.BlockedReason = "subsystem attr_allow_any_host exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Namespace, "enable")) && !isRegularFile(filepath.Join(p.Namespace, "enable")) {
+	if existsNotRegularFile(filepath.Join(p.Namespace, "enable")) {
 		r.BlockedReason = "namespace enable exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Namespace, "device_path")) && !isRegularFile(filepath.Join(p.Namespace, "device_path")) {
+	if existsNotRegularFile(filepath.Join(p.Namespace, "device_path")) {
 		r.BlockedReason = "namespace device_path exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Port, "addr_trtype")) && !isRegularFile(filepath.Join(p.Port, "addr_trtype")) {
+	if existsNotRegularFile(filepath.Join(p.Port, "addr_trtype")) {
 		r.BlockedReason = "port addr_trtype exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Port, "addr_adrfam")) && !isRegularFile(filepath.Join(p.Port, "addr_adrfam")) {
+	if existsNotRegularFile(filepath.Join(p.Port, "addr_adrfam")) {
 		r.BlockedReason = "port addr_adrfam exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Port, "addr_traddr")) && !isRegularFile(filepath.Join(p.Port, "addr_traddr")) {
+	if existsNotRegularFile(filepath.Join(p.Port, "addr_traddr")) {
 		r.BlockedReason = "port addr_traddr exists but is not regular file"
 		return r, StateBlocked
 	}
-	if exists(filepath.Join(p.Port, "addr_trsvcid")) && !isRegularFile(filepath.Join(p.Port, "addr_trsvcid")) {
+	if existsNotRegularFile(filepath.Join(p.Port, "addr_trsvcid")) {
 		r.BlockedReason = "port addr_trsvcid exists but is not regular file"
 		return r, StateBlocked
+	}
+	if c.QoSEnabled {
+		if existsNotDir(p.RDMACMDevice) {
+			r.BlockedReason = "rdma_cm device path exists but is not directory"
+			return r, StateBlocked
+		}
+		if existsNotDir(p.RDMACMPort) {
+			r.BlockedReason = "rdma_cm port path exists but is not directory"
+			return r, StateBlocked
+		}
+		if existsNotRegularFile(p.RDMADefaultTOS) {
+			r.BlockedReason = "rdma_cm default_roce_tos exists but is not regular file"
+			return r, StateBlocked
+		}
 	}
 
 	hasArtifact := exists(p.Subsystem) || exists(p.Namespace) || exists(p.PortLink)
@@ -541,10 +612,19 @@ func runtimeMatches(c Config, p Paths) bool {
 	if readAttr(filepath.Join(p.Port, "addr_trsvcid")) != strconv.Itoa(c.ServiceID) {
 		return false
 	}
+	if c.QoSEnabled {
+		if readAttr(p.RDMADefaultTOS) != strconv.Itoa(c.QoSRoCETOS) {
+			return false
+		}
+	}
 	return hostsMatch(c, p)
 }
 
 func createTarget(c Config, p Paths) error {
+	if err := configureQoS(c, p); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(p.Subsystem, 0700); err != nil {
 		return fmt.Errorf("mkdir subsystem: %w", err)
 	}
@@ -581,29 +661,42 @@ func createTarget(c Config, p Paths) error {
 	return replaceSymlink(p.PortLink, p.Subsystem)
 }
 
+func configureQoS(c Config, p Paths) error {
+	if !c.QoSEnabled {
+		return nil
+	}
+	if err := os.MkdirAll(p.RDMACMDevice, 0700); err != nil {
+		return fmt.Errorf("mkdir rdma_cm device: %w", err)
+	}
+	if !waitForDir(p.RDMACMPort, attrWriteTimeout) {
+		return fmt.Errorf("rdma_cm port path is not available: %s", p.RDMACMPort)
+	}
+	return writeAttr(p.RDMADefaultTOS, strconv.Itoa(c.QoSRoCETOS))
+}
+
 func stopArtifacts(p Paths) error {
-	if exists(p.Subsystems) && !isDir(p.Subsystems) {
+	if existsNotDir(p.Subsystems) {
 		return errors.New("blocked: subsystems path exists but is not directory")
 	}
-	if exists(p.Subsystem) && !isDir(p.Subsystem) {
+	if existsNotDir(p.Subsystem) {
 		return errors.New("blocked: subsystem path exists but is not directory")
 	}
-	if exists(p.Namespaces) && !isDir(p.Namespaces) {
+	if existsNotDir(p.Namespaces) {
 		return errors.New("blocked: namespaces path exists but is not directory")
 	}
-	if exists(p.Namespace) && !isDir(p.Namespace) {
+	if existsNotDir(p.Namespace) {
 		return errors.New("blocked: namespace path exists but is not directory")
 	}
-	if exists(p.Ports) && !isDir(p.Ports) {
+	if existsNotDir(p.Ports) {
 		return errors.New("blocked: ports path exists but is not directory")
 	}
-	if exists(p.Port) && !isDir(p.Port) {
+	if existsNotDir(p.Port) {
 		return errors.New("blocked: port path exists but is not directory")
 	}
-	if exists(p.PortSubsystems) && !isDir(p.PortSubsystems) {
+	if existsNotDir(p.PortSubsystems) {
 		return errors.New("blocked: port subsystems path exists but is not directory")
 	}
-	if exists(p.AllowedHosts) && !isDir(p.AllowedHosts) {
+	if existsNotDir(p.AllowedHosts) {
 		return errors.New("blocked: allowed_hosts path exists but is not directory")
 	}
 
@@ -720,6 +813,31 @@ func isSymlink(path string) bool {
 func isRegularFile(path string) bool {
 	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular()
+}
+
+func existsNotDir(path string) bool {
+	return exists(path) && !isDir(path)
+}
+
+func existsNotSymlink(path string) bool {
+	return exists(path) && !isSymlink(path)
+}
+
+func existsNotRegularFile(path string) bool {
+	return exists(path) && !isRegularFile(path)
+}
+
+func waitForDir(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if isDir(path) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func readAttr(path string) string {
@@ -842,6 +960,10 @@ func validConfigfsName(s string) bool {
 		}
 	}
 	return true
+}
+
+func hasNQNPrefix(s string) bool {
+	return strings.HasPrefix(s, "nqn.") || strings.HasPrefix(s, "eui.")
 }
 
 func runCommandQuiet(name string, args ...string) error {

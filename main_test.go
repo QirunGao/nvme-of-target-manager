@@ -24,14 +24,32 @@ func testConfig() Config {
 func withFakeNvmet(t *testing.T) Config {
 	t.Helper()
 	old := nvmetPath
+	oldRDMA := rdmaCMPath
 	nvmetPath = filepath.Join(t.TempDir(), "nvmet")
+	rdmaCMPath = filepath.Join(t.TempDir(), "rdma_cm")
 	for _, dir := range []string{"subsystems", "ports", "hosts"} {
 		if err := os.MkdirAll(filepath.Join(nvmetPath, dir), 0700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { nvmetPath = old })
+	t.Cleanup(func() {
+		nvmetPath = old
+		rdmaCMPath = oldRDMA
+	})
 	return testConfig()
+}
+
+func enableFakeQoS(t *testing.T, cfg *Config) Paths {
+	t.Helper()
+	cfg.Transport = "rdma"
+	cfg.QoSEnabled = true
+	cfg.QoSRDMADevice = "mlx5_0"
+	cfg.QoSRDMAPort = 1
+	cfg.QoSRoCETOS = 106
+	cfg.QoSPCPPriority = 3
+	paths := derivePaths(*cfg)
+	writeFile(t, paths.RDMADefaultTOS, "0")
+	return paths
 }
 
 func requireSymlink(t *testing.T) {
@@ -81,12 +99,25 @@ func TestStartCreatesTarget(t *testing.T) {
 		t.Fatal("port subsystem link does not point at subsystem")
 	}
 	for _, host := range cfg.AllowedHosts {
-		if !isDir(filepath.Join(nvmetPath, "hosts", host)) {
+		if !isDir(filepath.Join(paths.Hosts, host)) {
 			t.Fatalf("host object was not created: %s", host)
 		}
 		if !isSymlink(filepath.Join(paths.Subsystem, "allowed_hosts", host)) {
 			t.Fatalf("allowed host link was not created: %s", host)
 		}
+	}
+}
+
+func TestCreateTargetWritesQoS(t *testing.T) {
+	requireSymlink(t)
+	cfg := withFakeNvmet(t)
+	paths := enableFakeQoS(t, &cfg)
+
+	if err := createTarget(cfg, paths); err != nil {
+		t.Fatalf("createTarget() error = %v", err)
+	}
+	if got := readAttr(paths.RDMADefaultTOS); got != "106" {
+		t.Fatalf("default_roce_tos = %q, want %q", got, "106")
 	}
 }
 
@@ -113,6 +144,21 @@ func TestStatusDirty(t *testing.T) {
 	}
 
 	writeFile(t, filepath.Join(paths.Namespace, "device_path"), "/dev/other")
+	_, st := observe(cfg, paths)
+	if st != StateDirty {
+		t.Fatalf("observe() = %s, want %s", st, StateDirty)
+	}
+}
+
+func TestStatusDirtyWhenQoSMismatches(t *testing.T) {
+	requireSymlink(t)
+	cfg := withFakeNvmet(t)
+	paths := enableFakeQoS(t, &cfg)
+	if err := createTarget(cfg, paths); err != nil {
+		t.Fatalf("createTarget() error = %v", err)
+	}
+
+	writeFile(t, paths.RDMADefaultTOS, "104")
 	_, st := observe(cfg, paths)
 	if st != StateDirty {
 		t.Fatalf("observe() = %s, want %s", st, StateDirty)
@@ -174,6 +220,22 @@ func TestStopRemovesArtifacts(t *testing.T) {
 		if !isDir(filepath.Join(paths.Hosts, host)) {
 			t.Fatalf("global host object should be preserved: %s", host)
 		}
+	}
+}
+
+func TestStopDoesNotRemoveQoS(t *testing.T) {
+	requireSymlink(t)
+	cfg := withFakeNvmet(t)
+	paths := enableFakeQoS(t, &cfg)
+	if err := createTarget(cfg, paths); err != nil {
+		t.Fatalf("createTarget() error = %v", err)
+	}
+
+	if err := stopArtifacts(paths); err != nil {
+		t.Fatalf("stopArtifacts() error = %v", err)
+	}
+	if got := readAttr(paths.RDMADefaultTOS); got != "106" {
+		t.Fatalf("default_roce_tos after stop = %q, want %q", got, "106")
 	}
 }
 
@@ -301,7 +363,7 @@ func TestHostsMatchRequiresExactLinks(t *testing.T) {
 	if err := os.Remove(filepath.Join(paths.AllowedHosts, cfg.AllowedHosts[0])); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(nvmetPath, "hosts", cfg.AllowedHosts[0]), filepath.Join(paths.AllowedHosts, cfg.AllowedHosts[0])); err != nil {
+	if err := os.Symlink(filepath.Join(paths.Hosts, cfg.AllowedHosts[0]), filepath.Join(paths.AllowedHosts, cfg.AllowedHosts[0])); err != nil {
 		t.Fatal(err)
 	}
 	cfg.AllowAnyHost = true
@@ -320,7 +382,7 @@ func TestHostsMatchRequiresHostObject(t *testing.T) {
 		t.Fatalf("createTarget() error = %v", err)
 	}
 
-	if err := os.Remove(filepath.Join(nvmetPath, "hosts", cfg.AllowedHosts[0])); err != nil {
+	if err := os.Remove(filepath.Join(paths.Hosts, cfg.AllowedHosts[0])); err != nil {
 		t.Fatal(err)
 	}
 	if _, st := observe(cfg, paths); st != StateDirty {
@@ -332,7 +394,7 @@ func TestValidateRejectsDuplicateHosts(t *testing.T) {
 	raw := RawConfig{}
 	raw.Subsystem.NQN = "nqn.2026-04.local.test"
 	raw.Namespace.ID = 1
-	raw.Namespace.BackingDev = "/dev/test"
+	raw.Namespace.BackingDev = filepath.Join(t.TempDir(), "dev")
 	raw.Port.ID = 1
 	raw.Port.Transport = "tcp"
 	raw.Port.AddressFamily = "ipv4"
@@ -365,6 +427,33 @@ func TestValidateRejectsOuterWhitespace(t *testing.T) {
 	raw.Hosts.Allowed = []string{"nqn.2026-04.local.host "}
 	if _, err := validateConfig(raw); err == nil {
 		t.Fatal("validateConfig should reject host outer whitespace")
+	}
+}
+
+func TestValidateQoS(t *testing.T) {
+	raw := RawConfig{}
+	raw.Subsystem.NQN = "nqn.2026-04.local.test"
+	raw.Namespace.ID = 1
+	raw.Namespace.BackingDev = filepath.Join(t.TempDir(), "dev")
+	raw.Port.ID = 1
+	raw.Port.Transport = "rdma"
+	raw.Port.AddressFamily = "ipv4"
+	raw.Port.Address = "192.0.2.10"
+	raw.Port.ServiceID = 4420
+	raw.Hosts.AllowAnyHost = true
+	raw.QoS.Enabled = true
+	raw.QoS.RDMADevice = "mlx5_0"
+	raw.QoS.RDMAPort = 1
+	raw.QoS.RoCETOS = 106
+	raw.QoS.PCPPriority = 3
+
+	if _, err := validateConfig(raw); err != nil {
+		t.Fatalf("validateConfig() error = %v", err)
+	}
+
+	raw.QoS.PCPPriority = 4
+	if _, err := validateConfig(raw); err == nil {
+		t.Fatal("validateConfig should reject mismatched qos.pcp_priority")
 	}
 }
 

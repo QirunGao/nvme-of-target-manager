@@ -92,6 +92,16 @@ service_id = 4420
 [hosts]
 allow_any_host = true
 allowed = []
+
+# Optional. RDMA-CM ToS hint for RoCE targets.
+# This does not configure VLAN, PFC, DCB, tc, ethtool, or switches.
+#
+# [qos]
+# enabled = true
+# rdma_device = "mlx5_0"
+# rdma_port = 1
+# roce_tos = 106
+# pcp_priority = 3
 ```
 
 For an explicit host allow-list:
@@ -144,6 +154,38 @@ Use one TOML file per target. To avoid accidental overlap:
   host NQN.
 - Global host objects under `/sys/kernel/config/nvmet/hosts` are created if
   needed and are not removed by this tool.
+- If multiple configs enable `[qos]` for the same `rdma_device` and
+  `rdma_port`, keep `roce_tos` and `pcp_priority` identical. The manager does
+  not arbitrate shared RDMA-CM port QoS.
+
+## RDMA-CM QoS
+
+For RoCE targets, the optional `[qos]` section writes one configfs attribute:
+
+```text
+/sys/kernel/config/rdma_cm/<rdma_device>/ports/<rdma_port>/default_roce_tos
+```
+
+Example:
+
+```toml
+[qos]
+enabled = true
+rdma_device = "mlx5_0"
+rdma_port = 1
+roce_tos = 106
+pcp_priority = 3
+```
+
+`pcp_priority` must match the high three bits of `roce_tos`; for example,
+`106 >> 5 == 3`.
+
+This is only an RDMA-CM ToS hint. VLAN PCP maps, PFC, DCB, `tc`, `ethtool`, and
+switch QoS are host/network fabric configuration and should be managed outside
+this tool.
+
+`stop` does not reset RDMA-CM QoS because it is device/port level state, not a
+single target artifact.
 
 ## CLI
 

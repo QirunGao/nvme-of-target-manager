@@ -15,3 +15,14 @@ service_id = 4420
 [hosts]
 allow_any_host = true
 allowed = []
+
+# Optional RDMA-CM QoS hint for RoCE.
+# This only writes:
+# /sys/kernel/config/rdma_cm/<rdma_device>/ports/<rdma_port>/default_roce_tos
+#
+# [qos]
+# enabled = true
+# rdma_device = "mlx5_0"
+# rdma_port = 1
+# roce_tos = 106
+# pcp_priority = 3
